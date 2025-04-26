@@ -3,295 +3,248 @@ import hmac
 import hashlib
 import time
 import urllib.parse
-import decimal # For precise quantity calculation
+import decimal
 import os
-from dotenv import load_dotenv
+# import signal
+import sys
+from dotenv import load_dotenv # Import dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# --- Default Strategy Parameters (Internal) ---
+DEFAULT_ITERATIONS = 5
+DEFAULT_DELAY_SECONDS = 1
+DEFAULT_POLL_INTERVAL_SECONDS = 0.5
+DEFAULT_MAX_POLL_ATTEMPTS = 20
+# ORDER_QUANTITY will be calculated based on USDT amount
+MIN_NOTIONAL_VALUE = decimal.Decimal("5") # Example minimum
 
-# --- Get API Keys from Environment Variables ---
-API_KEY = os.getenv("ASTER_API_KEY")
-SECRET_KEY = os.getenv("ASTER_SECRET_KEY")
+# --- Determine Run Mode & Load Params ---
+API_KEY = None
+SECRET_KEY = None
+TARGET_SYMBOL = None
+USDT_AMOUNT_STR = None
+ITERATIONS_STR = None # Add this for iterations
+RUN_MODE = "Unknown"
 
-# --- Check if keys were loaded --- 
-if not API_KEY or not SECRET_KEY:
-    print("[ERROR] API_KEY or SECRET_KEY not found in environment variables.")
-    print("Please ensure you have a .env file with ASTER_API_KEY and ASTER_SECRET_KEY defined.")
-    exit(1) # Exit the script if keys are missing
+# Check if run by app.py (presence of VAULT_ vars)
+if "VAULT_API_KEY" in os.environ:
+    RUN_MODE = "App-Driven"
+    print(f"[{RUN_MODE}] Reading parameters from VAULT environment variables...")
+    API_KEY = os.environ.get("VAULT_API_KEY")
+    SECRET_KEY = os.environ.get("VAULT_SECRET_KEY")
+    TARGET_SYMBOL = os.environ.get("VAULT_SYMBOL") # Required
+    USDT_AMOUNT_STR = os.environ.get("VAULT_USDT_AMOUNT") # Required
+    ITERATIONS_STR = os.environ.get("VAULT_ITERATIONS") # Optional from Vault
 else:
-    # --- TEMPORARY DEBUG PRINT --- #
-    print("[TEMP DEBUG] Loaded Keys:")
-    print(f"  API_KEY:    {API_KEY[:5]}...{API_KEY[-5:]}") # Print first/last 5 chars
-    print(f"  SECRET_KEY: {SECRET_KEY[:5]}...{SECRET_KEY[-5:]}") # Print first/last 5 chars
-    # --- REMOVE AFTER CHECKING --- #
-# ------------------------------------------
+    # Assume Standalone/Debug mode
+    RUN_MODE = "Standalone/Debug"
+    print(f"[{RUN_MODE}] VAULT variables not found. Attempting to load from .env...")
+    dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path=dotenv_path)
+        print(f"[{RUN_MODE}] Loaded .env file: {dotenv_path}")
+        API_KEY = os.getenv("ASTER_API_KEY")
+        SECRET_KEY = os.getenv("ASTER_SECRET_KEY")
+        TARGET_SYMBOL = os.getenv("DEBUG_SYMBOL", "CRVUSDT")
+        USDT_AMOUNT_STR = os.getenv("DEBUG_USDT_AMOUNT")
+        ITERATIONS_STR = os.getenv("DEBUG_ITERATIONS") # Optional from .env for debug
+    else:
+        print(f"[{RUN_MODE} WARNING] .env file not found at {dotenv_path}. Cannot load debug parameters.")
 
+# --- Validate Core Parameters ---
+if not API_KEY or not SECRET_KEY:
+    print(f"[{RUN_MODE} ERROR] API_KEY or SECRET_KEY missing.", file=sys.stderr); sys.exit(1)
+if not TARGET_SYMBOL:
+    print(f"[{RUN_MODE} ERROR] TARGET_SYMBOL missing.", file=sys.stderr); sys.exit(1)
+if not USDT_AMOUNT_STR:
+    if RUN_MODE == "Standalone/Debug":
+        print(f"[{RUN_MODE} ERROR] DEBUG_USDT_AMOUNT not found in .env.", file=sys.stderr)
+    else: # App-Driven
+        print(f"[{RUN_MODE} ERROR] VAULT_USDT_AMOUNT missing.", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    USDT_AMOUNT = decimal.Decimal(USDT_AMOUNT_STR)
+    if USDT_AMOUNT <= 0: raise ValueError("USDT amount must be positive.")
+except Exception as e: print(f"[{RUN_MODE} ERROR] Invalid USDT Amount: {e}", file=sys.stderr); sys.exit(1)
+
+# Process iterations based on the new logic
+ITERATIONS = None  # Default to None (infinite) before checking mode-specific vars
+iterations_source_var = None
+
+if RUN_MODE == "App-Driven":
+    iterations_source_var = "VAULT_ITERATIONS"
+elif RUN_MODE == "Standalone/Debug":
+    iterations_source_var = "DEBUG_ITERATIONS"
+
+if iterations_source_var and ITERATIONS_STR: # Check if the specific var for this mode was set
+    try:
+        parsed_iterations = int(ITERATIONS_STR)
+        if parsed_iterations < 1:
+            raise ValueError("Iterations must be at least 1")
+        ITERATIONS = parsed_iterations # Set to finite number if valid
+    except ValueError as e:
+        # Use specific variable name in warning based on mode
+        print(f"[{RUN_MODE} WARN] Invalid {iterations_source_var} '{ITERATIONS_STR}' ({e}). Falling back to {DEFAULT_ITERATIONS} iterations.")
+        ITERATIONS = DEFAULT_ITERATIONS # Fallback to default 5 as safety
+# If the mode-specific variable was NOT set (ITERATIONS_STR is None), ITERATIONS remains None (infinite)
+
+# Use other internal defaults
+DELAY_SECONDS = DEFAULT_DELAY_SECONDS
+POLL_INTERVAL_SECONDS = DEFAULT_POLL_INTERVAL_SECONDS
+MAX_POLL_ATTEMPTS = DEFAULT_MAX_POLL_ATTEMPTS
+
+# --- Constants & Precision ---
 BASE_URL = "https://fapi.asterdex.com"
-# Define precision for CRVUSDT - based on /fapi/v1/exchangeInfo
-# Price precision (decimal places for price)
-PRICE_PRECISION = decimal.Decimal('0.001') # 4 decimal places
-# Quantity precision (decimal places for quantity)
-QUANTITY_PRECISION = decimal.Decimal('1') # 0 decimal places (integer)
-TICK_SIZE = decimal.Decimal('0.001') # Smallest price change (matches price precision)
+PRICE_PRECISION = decimal.Decimal('0.0001') # Needed for price fetch, not orders
+QUANTITY_PRECISION = decimal.Decimal('1')
+TICK_SIZE = decimal.Decimal('0.0001')
 
+# --- API Functions (Identical to grid strategies) ---
 def get_server_time():
-    """獲取伺服器時間 (用於生成 timestamp)"""
-    try:
-        response = requests.get(f"{BASE_URL}/fapi/v1/time")
-        response.raise_for_status() # 檢查請求是否成功
-        return response.json()['serverTime']
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching server time: {e}")
-        return None
-
+    try: response = requests.get(f"{BASE_URL}/fapi/v1/time"); response.raise_for_status(); return response.json()['serverTime']
+    except Exception as e: print(f"Error getting server time: {e}", file=sys.stderr); return None
 def generate_signature(params_str):
-    """生成 HMAC SHA256 簽名"""
+    if not SECRET_KEY: print("[ERROR] No secret key.", file=sys.stderr); return None
     return hmac.new(SECRET_KEY.encode('utf-8'), params_str.encode('utf-8'), hashlib.sha256).hexdigest()
-
 def make_signed_request(method, endpoint, params=None):
-    """發送簽名的 API 請求"""
-    if params is None:
-        params = {}
-
-    # --- Timestamp Check --- 
-    api_server_time_ms = get_server_time() 
-    if api_server_time_ms is None:
-        print("[ERROR] Could not get server time from API!")
-        return None # 無法獲取伺服器時間
-    
-    local_time_ms = int(time.time() * 1000)
-    time_diff_ms = local_time_ms - api_server_time_ms
-
-    print(f"[DEBUG] Timestamp Check:")
-    print(f"  Local System Time (ms): {local_time_ms}")
-    print(f"  API Server Time (ms):   {api_server_time_ms}")
-    print(f"  Difference (Local - API): {time_diff_ms} ms")
-
-    # Check if the difference is too large (e.g., more than a few seconds)
-    max_allowed_diff_ms = 5000 # Allow 5 seconds difference, adjust as needed
-    if abs(time_diff_ms) > max_allowed_diff_ms:
-        print(f"[WARNING] Significant time difference detected ({time_diff_ms} ms)! Check system clock synchronization.")
-        # You might choose to exit or use API time strictly here, depending on policy
-    # ----------------------- 
-
-    # Use API server time for the request timestamp for consistency
-    # NOTE: The original `params` dict only contains the non-signature parameters at this point
-    params_for_signing = params.copy() # Create a copy for signing
-    params_for_signing['timestamp'] = int(api_server_time_ms)
-    params_for_signing['recvWindow'] = 5000 # 設置請求有效時間窗口 (毫秒)
-
-    # --- 生成待簽名字符串 (基於原始參數，按字母排序 - 正確方式) ---
-    query_string_to_sign = urllib.parse.urlencode(sorted(params_for_signing.items()))
-    # --- END --- 
-
-    print(f"[DEBUG] String to sign: {query_string_to_sign}")
-
-    # 生成簽名
-    signature = generate_signature(query_string_to_sign)
-    print(f"[DEBUG] Generated signature: {signature}")
-    # params['signature'] = signature # 將簽名加入參數 (REMOVED - DO NOT ADD TO DICT)
-
-    # --- 構建最終請求 URL 或 Body --- 
-    # 根據 API 文件示例 1，所有參數 (包括簽名) 都放在 query string 中
-    final_query_string = f"{query_string_to_sign}&signature={signature}"
-    full_url = f"{BASE_URL}{endpoint}?{final_query_string}"
-    print(f"[DEBUG] Full URL with signature: {full_url}") # Debug the final URL
-    # -----------------------------------
-
-    headers = {
-        'X-MBX-APIKEY': API_KEY
-    }
-    # url = f"{BASE_URL}{endpoint}" (REMOVED - Use full_url)
-
+    if params is None: params = {}
+    t = get_server_time();
+    if t is None: return None
+    pfs = params.copy(); pfs['timestamp']=int(t); pfs['recvWindow']=5000
+    qs = urllib.parse.urlencode(sorted(pfs.items())); sig = generate_signature(qs)
+    if sig is None: return None
+    fqs = f"{qs}&signature={sig}"; url = f"{BASE_URL}{endpoint}?{fqs}"
+    hdrs = {'X-MBX-APIKEY': API_KEY};
+    if not API_KEY: print("[ERROR] No API key.", file=sys.stderr); return None
     try:
-        # Important: Pass the manually constructed full_url
-        # Do NOT use the 'params' argument in requests for signed requests now
-        if method.upper() == 'GET':
-            print(f"[DEBUG] Sending GET request to: {full_url}")
-            response = requests.get(full_url, headers=headers)
-        elif method.upper() == 'POST':
-            print(f"[DEBUG] Sending POST request to: {full_url}")
-            # POST request body should be empty as all params are in query string per Example 1
-            response = requests.post(full_url, headers=headers)
-        elif method.upper() == 'DELETE':
-            print(f"[DEBUG] Sending DELETE request to: {full_url}")
-            response = requests.delete(full_url, headers=headers)
-        else:
-            print(f"Unsupported method: {method}")
-            return None
-
-        response.raise_for_status() # 檢查 HTTP 狀態碼
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"API Request Error ({method} {full_url}): {e}")
-        if e.response is not None:
-            print(f"Response Body: {e.response.text}")
+        if method.upper()=='GET': r=requests.get(url,headers=hdrs)
+        elif method.upper()=='POST': r=requests.post(url,headers=hdrs)
+        elif method.upper()=='DELETE': r=requests.delete(url,headers=hdrs)
+        else: print(f"Unsupported method: {method}", file=sys.stderr); return None
+        r.raise_for_status(); return r.json()
+    except Exception as e:
+        print(f"API Error {method} {endpoint}: {e}", file=sys.stderr)
+        if hasattr(e, 'response') and e.response is not None:
+             print(f" Resp: {e.response.text}", file=sys.stderr)
         return None
+def get_current_price(symbol):
+    # Public endpoint, no signing needed
+    endpoint = "/fapi/v1/ticker/price"; params = {'symbol': symbol}
+    try: r=requests.get(f"{BASE_URL}{endpoint}",params=params); r.raise_for_status(); return decimal.Decimal(r.json()['price'])
+    except Exception as e: print(f"Error getting price {symbol}: {e}", file=sys.stderr); return None
 
-def get_book_ticker(symbol):
-    """獲取指定交易對的最佳買賣價"""
-    endpoint = "/fapi/v1/ticker/bookTicker"
-    params = {'symbol': symbol}
-    try:
-        response = requests.get(f"{BASE_URL}{endpoint}", params=params)
-        response.raise_for_status()
-        data = response.json()
-        # Return prices as Decimals for precision
-        return {
-            'bidPrice': decimal.Decimal(data['bidPrice']),
-            'askPrice': decimal.Decimal(data['askPrice'])
-        }
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching book ticker for {symbol}: {e}")
-        return None
-    except KeyError as e:
-        print(f"Error parsing book ticker response: Missing key {e}")
-        return None
-
-# --- 刷量策略的核心邏輯 ---
-
+# --- Volume Strategy Specific Functions ---
 def place_market_order(symbol, side, quantity):
-    """下市價單"""
     endpoint = "/fapi/v1/order"
-    params = {
-        'symbol': symbol,
-        'side': side.upper(),
-        'type': 'MARKET', # Changed from LIMIT
-        'quantity': str(quantity), # Use quantity directly
-    }
-    # Market orders don't need price or timeInForce
-    print(f"Attempting to place MARKET {side} order: {quantity} {symbol.replace('USDT', '')}")
-    result = make_signed_request('POST', endpoint, params)
-    return result
-
+    try:
+        formatted_quantity = quantity.quantize(QUANTITY_PRECISION, decimal.ROUND_DOWN)
+        if formatted_quantity <= 0: print(f"[ERROR] Mkt Ord Qty <= 0 ({formatted_quantity}).", file=sys.stderr); return None
+    except Exception as e: print(f"[ERROR] Format Mkt Ord Qty: {e}", file=sys.stderr); return None
+    params = {'symbol': symbol, 'side': side.upper(), 'type': 'MARKET', 'quantity': str(formatted_quantity)}
+    print(f"Placing MARKET {side} {formatted_quantity} {symbol.replace('USDT', '')}...")
+    return make_signed_request('POST', endpoint, params)
 def get_order_status(symbol, order_id):
-    """查詢指定訂單的狀態"""
-    endpoint = "/fapi/v1/order"
-    params = {
-        'symbol': symbol,
-        'orderId': str(order_id)
-    }
-    print(f"Polling status for order ID: {order_id}")
-    result = make_signed_request('GET', endpoint, params)
-    return result
+    endpoint = "/fapi/v1/order"; params = {'symbol': symbol, 'orderId': str(order_id)}
+    return make_signed_request('GET', endpoint, params)
 
-# --- Removed place_limit_order --- 
-# --- Removed cancel_order --- 
-# --- Removed get_open_orders --- 
-# --- Removed get_book_ticker --- 
-
-# --- 主要執行部分 ---
+# --- Main Execution ---
 if __name__ == "__main__":
-    # Check if API keys are loaded properly
-    if not API_KEY or not SECRET_KEY:
-        print("[ERROR] API_KEY or SECRET_KEY not found in environment variables.")
-        print("Please ensure you have a .env file with ASTER_API_KEY and ASTER_SECRET_KEY defined.")
-        exit(1)
 
-    # --- Strategy Parameters ---
-    target_symbol = "CRVUSDT"
-    order_quantity = 10      # Fixed quantity (e.g., 10 CRV, known to be > 5 USDT notional)
-    iterations = 5
-    delay_seconds = 1        # Delay between buy/sell cycles
-    poll_interval_seconds = 0.5 # How often to check order status
-    max_poll_attempts = 20   # Max times to check status before giving up (20 * 0.5s = 10s timeout)
-    # -------------------------
+    # --- Calculate Order Quantity based on USDT Amount and Current Price ---
+    print(f"Fetching current price for {TARGET_SYMBOL} to calculate order quantity...")
+    current_price = get_current_price(TARGET_SYMBOL)
+    if current_price is None or current_price <= 0:
+        print(f"[ERROR] Could not fetch a valid current price for {TARGET_SYMBOL}. Exiting.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Calculate quantity: USDT / Price
+    calculated_order_qty_precise = USDT_AMOUNT / current_price
+    ORDER_QUANTITY = calculated_order_qty_precise.quantize(QUANTITY_PRECISION, decimal.ROUND_DOWN)
+    
+    print(f"[INFO] Current Price={current_price:.4f}, USDT Amount={USDT_AMOUNT} -> Calculated Order Qty={ORDER_QUANTITY}")
 
-    print(f"Starting Market Order Wash Trading Strategy for {target_symbol}...")
-    print(f"Order Quantity per trade: {order_quantity} {target_symbol.replace('USDT','')}")
-    print(f"Running for {iterations} iterations with {delay_seconds}s delay between cycles.")
+    # --- Sanity Checks ---
+    if ORDER_QUANTITY <= 0:
+        print(f"[ERROR] Calculated order quantity is zero or negative ({ORDER_QUANTITY}). USDT amount might be too low for the current price.", file=sys.stderr)
+        sys.exit(1)
+    min_notional_check = ORDER_QUANTITY * current_price # Approximate notional
+    if min_notional_check < MIN_NOTIONAL_VALUE:
+        print(f"[ERROR] Calculated order notional value ({min_notional_check:.4f} USDT) is below minimum required ({MIN_NOTIONAL_VALUE} USDT).", file=sys.stderr)
+        sys.exit(1)
+    # --------------------
 
-    for i in range(iterations):
-        print(f"\n--- Cycle {i+1}/{iterations} --- commencing --- ")
-        buy_order_filled = False
-        sell_order_filled = False
-        buy_order_id = None
-        sell_order_id = None
+    print(f"--- Market Order Volume Strategy Initializing (from Vault) ---")
+    print(f"Symbol: {TARGET_SYMBOL}")
+    print(f"USDT Amount Target per Trade: {USDT_AMOUNT}")
+    print(f"==> Calculated Order Quantity per trade: {ORDER_QUANTITY} {TARGET_SYMBOL.replace('USDT','')}")
+    print(f"Using Iterations: {ITERATIONS} (Default or from VAULT_ITERATIONS)")
+    print(f"Using Delay: {DELAY_SECONDS}s, Poll Interval: {POLL_INTERVAL_SECONDS}s, Max Attempts: {MAX_POLL_ATTEMPTS}")
+    print(f"Using Precisions: Qty={QUANTITY_PRECISION}")
 
-        # --- 1. Place Market Buy Order ---
-        buy_place_result = place_market_order(target_symbol, 'BUY', order_quantity)
-        
-        if buy_place_result and 'orderId' in buy_place_result:
-            buy_order_id = buy_place_result['orderId']
-            print(f"Market BUY order placed successfully. ID: {buy_order_id}, Status: {buy_place_result.get('status')}")
-            
-            # --- 2. Poll for Buy Order Fill ---
-            for attempt in range(max_poll_attempts):
-                time.sleep(poll_interval_seconds)
-                order_status_result = get_order_status(target_symbol, buy_order_id)
-                
-                if order_status_result:
-                    status = order_status_result.get('status')
-                    print(f"  Poll attempt {attempt+1}/{max_poll_attempts}: Buy Order {buy_order_id} status = {status}")
-                    if status == 'FILLED':
-                        print(f"BUY Order {buy_order_id} confirmed FILLED.")
-                        buy_order_filled = True
-                        break
-                    elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
-                        print(f"[ERROR] BUY Order {buy_order_id} failed or was canceled. Status: {status}")
-                        break # Exit polling loop on failure
-                else:
-                    print(f"  Poll attempt {attempt+1}/{max_poll_attempts}: Failed to get status for Buy Order {buy_order_id}.")
-                    # Continue polling in case of temporary network issue
-            
-            if not buy_order_filled:
-                print(f"[ERROR] BUY Order {buy_order_id} did not fill after {max_poll_attempts} attempts. Skipping sell.")
-                # Optional: Attempt to cancel the potentially stuck order here if needed
-                # cancel_order(target_symbol, buy_order_id)
-                continue # Skip to next iteration
+    # --- Main Loop --- 
+    current_cycle = 0
+    while True:
+        current_cycle += 1
+        cycle_str = f"{current_cycle}"
+        if ITERATIONS is not None:
+            cycle_str += f"/{ITERATIONS}"
+        print(f"--- Cycle {cycle_str} --- commencing --- ")
 
-        else:
-            print(f"[ERROR] Failed to place Market BUY order. Response: {buy_place_result}")
-            continue # Skip to next iteration
+        buy_filled, sell_filled = False, False
+        buy_oid, sell_oid = None, None
 
-        # --- 3. Place Market Sell Order (only if buy filled) ---
-        if buy_order_filled:
-            sell_place_result = place_market_order(target_symbol, 'SELL', order_quantity)
+        # --- 1. Place Market Buy Order --- 
+        print(f"Placing BUY order...")
+        buy_res = place_market_order(TARGET_SYMBOL, 'BUY', ORDER_QUANTITY)
+        if buy_res and isinstance(buy_res, dict) and 'orderId' in buy_res:
+            buy_oid = buy_res['orderId']
+            print(f" BUY Placed. ID:{buy_oid}, Status:{buy_res.get('status')}")
+            # --- 2. Poll for Buy Order Fill --- 
+            print(f" Polling BUY {buy_oid}...")
+            for attempt in range(MAX_POLL_ATTEMPTS):
+                time.sleep(POLL_INTERVAL_SECONDS)
+                status_res = get_order_status(TARGET_SYMBOL, buy_oid)
+                if status_res and isinstance(status_res, dict):
+                    stat = status_res.get('status')
+                    if stat == 'FILLED': print(f" BUY {buy_oid} FILLED."); buy_filled=True; break
+                    elif stat in ['CANCELED','EXPIRED','REJECTED','NEW']:
+                         if stat != 'NEW' or attempt == MAX_POLL_ATTEMPTS-1:
+                              print(f"[ERROR] BUY {buy_oid} failed/timeout. Status:{stat}", file=sys.stderr); buy_filled=False; break
+                else: print(f" Poll {attempt+1}: Failed status for BUY {buy_oid}.")
+            if not buy_filled: print(f"[ERROR] BUY {buy_oid} not filled. Skipping cycle.", file=sys.stderr); continue
+        else: print(f"[ERROR] Failed to place BUY order: {buy_res}", file=sys.stderr); continue
 
-            if sell_place_result and 'orderId' in sell_place_result:
-                sell_order_id = sell_place_result['orderId']
-                print(f"Market SELL order placed successfully. ID: {sell_order_id}, Status: {sell_place_result.get('status')}")
+        # --- 3. Place Market Sell Order --- 
+        if buy_filled:
+            print(f"Placing SELL order...")
+            sell_res = place_market_order(TARGET_SYMBOL, 'SELL', ORDER_QUANTITY)
+            if sell_res and isinstance(sell_res, dict) and 'orderId' in sell_res:
+                sell_oid = sell_res['orderId']
+                print(f" SELL Placed. ID:{sell_oid}, Status:{sell_res.get('status')}")
+                # --- 4. Poll for Sell Order Fill --- 
+                print(f" Polling SELL {sell_oid}...")
+                for attempt in range(MAX_POLL_ATTEMPTS):
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    status_res = get_order_status(TARGET_SYMBOL, sell_oid)
+                    if status_res and isinstance(status_res, dict):
+                        stat = status_res.get('status')
+                        if stat == 'FILLED': print(f" SELL {sell_oid} FILLED."); sell_filled=True; break
+                        elif stat in ['CANCELED','EXPIRED','REJECTED','NEW']:
+                            if stat != 'NEW' or attempt == MAX_POLL_ATTEMPTS-1:
+                                 print(f"[ERROR] SELL {sell_oid} failed/timeout. Status:{stat}", file=sys.stderr); break
+                    else: print(f" Poll {attempt+1}: Failed status for SELL {sell_oid}.")
+                if not sell_filled: print(f"[ERROR] SELL {sell_oid} not filled.", file=sys.stderr)
+            else: print(f"[ERROR] Failed to place SELL order: {sell_res}", file=sys.stderr)
+        # --- End Cycle --- 
+        state = "successfully" if buy_filled and sell_filled else "with errors"
 
-                # --- 4. Poll for Sell Order Fill ---
-                for attempt in range(max_poll_attempts):
-                    time.sleep(poll_interval_seconds)
-                    order_status_result = get_order_status(target_symbol, sell_order_id)
+        # Check if we need to stop (if iterations are finite)
+        if ITERATIONS is not None and current_cycle >= ITERATIONS:
+            print(f"--- Reached target {ITERATIONS} iterations. Finishing. ---")
+            break # Exit the while loop
 
-                    if order_status_result:
-                        status = order_status_result.get('status')
-                        print(f"  Poll attempt {attempt+1}/{max_poll_attempts}: Sell Order {sell_order_id} status = {status}")
-                        if status == 'FILLED':
-                            print(f"SELL Order {sell_order_id} confirmed FILLED.")
-                            sell_order_filled = True
-                            break
-                        elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
-                            print(f"[ERROR] SELL Order {sell_order_id} failed or was canceled. Status: {status}")
-                            break # Exit polling loop on failure
-                    else:
-                         print(f"  Poll attempt {attempt+1}/{max_poll_attempts}: Failed to get status for Sell Order {sell_order_id}.")
-                         # Continue polling
-                
-                if not sell_order_filled:
-                     print(f"[ERROR] SELL Order {sell_order_id} did not fill after {max_poll_attempts} attempts.")
-                     # Optional: Attempt to cancel
-
-            else:
-                 print(f"[ERROR] Failed to place Market SELL order. Response: {sell_place_result}")
-
-        # --- End of Cycle --- 
-        print(f"--- Cycle {i+1}/{iterations} completed. Waiting {delay_seconds}s --- ")
-        time.sleep(delay_seconds)
-
-    print("\nStrategy finished.")
-
-    # --- 刷量策略的其他步驟 --- (Now more integrated)
-    # 1. 獲取當前市場價格 - Done via get_book_ticker
-    # 2. 根據市價計算買賣價格 (e.g., 略高於買一價，略低於賣一價) - Done in place_limit_order with offset
-    # 3. 下買單 - Implemented
-    # 4. 下賣單 - Implemented
-    # 5. (可選) 監控訂單狀態 - Implemented get_open_orders and optional call
-    # 6. (可選) 如果訂單未成交或市場變動，取消訂單 - Implemented immediate cancel_order, advanced logic can be added
-    # 7. 控制頻率，避免觸發 API 頻率限制 - Added delay_seconds
-    # 8. 處理錯誤和異常 - Basic error handling improved slightly
-    # --------------------------- 
+        # Otherwise, wait for the next cycle
+        print(f"--- Cycle {cycle_str} completed {state}. Waiting {DELAY_SECONDS}s --- ")
+        time.sleep(DELAY_SECONDS)
+    # End main loop
+    print("Strategy finished.") 
